@@ -10,7 +10,7 @@ Supports the three Climate DT models **IFS-NEMO**, **IFS-FESOM**, and **ICON**.
 ### 1. Clone this repository
 
 ```bash
-git clone https://github.com/natr/polytope-climate-analysis.git
+git clone https://github.com/trackow/polytope-climatedt-analysis.git
 cd polytope-climate-analysis
 ```
 
