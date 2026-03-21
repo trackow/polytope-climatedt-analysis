@@ -119,7 +119,7 @@ O3D_VARIABLES = {
 }
 
 # ── Master catalogue ───────────────────────────────────────────────
-PORTFOLIO = {
+PORTFOLIO_GEN2 = {
     "sfc": {
         "levtype": "sfc",
         "levels": None,
