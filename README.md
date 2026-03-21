@@ -15,16 +15,6 @@ git clone https://github.com/trackow/polytope-climatedt-analysis.git
 cd polytope-climate-analysis
 ```
 
-> **`auto-batch` branch:** For the latest developments, automatic multi-year batching
-> via `.polytope.sel()`, the xarray accessor, and a `requirements.txt` with version pins,
-> switch to the `auto-batch` branch:
-> ```bash
-> git checkout auto-batch
-> ```
-> This extends `polytope_zarr.py` (~560 lines vs ~290 on `main`) with data
-> prefetching, GRIB metadata-based batch splitting, and an xarray accessor that
-> automatically infers an optimal batch size for Polytope from your time slice.  See [STORE.md](STORE.md) for a full walkthrough.
-
 ### 2. Set up the Python environment
 
 **Option A: Using conda**
