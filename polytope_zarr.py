@@ -30,7 +30,8 @@ class PolytopeZarrStore(MutableMapping):
     """A read-only zarr v2 store that fetches data from Polytope on demand."""
 
     def __init__(self, address, collection, base_request, coords, variables,
-                 internal_dims=None, time_fields=None):
+                 internal_dims=None, time_fields=None, batch_dim="time",
+                 batch_size=12, batch_years=1):
         """
         Parameters
         ----------
@@ -50,12 +51,26 @@ class PolytopeZarrStore(MutableMapping):
             Dims that form a single chunk (e.g. ["cell"]).
         time_fields : list, optional
             Request fields extracted from timestamps. Default ["year", "month"].
+        batch_dim : str, optional
+            Dimension to batch over in a single Polytope request.  Default "time".
+            Set to None to disable batching (one request per chunk).
+        batch_size : int, optional
+            Maximum number of months per year to fetch in one request.
+            Default 12 (= all months of each year).
+        batch_years : int, optional
+            Maximum number of years to combine in a single Polytope request
+            (only applies when batch_dim="time").  Default 1 — batch only
+            within the same calendar year.  Set to 5 or more for multi-year
+            slices; note that higher values pre-fetch more data on first access.
         """
         self._address = address
         self._collection = collection
         self._base_request = dict(base_request)
         self._internal_dims = set(internal_dims or [])
         self._time_fields = time_fields or ["year", "month"]
+        self._batch_dim = batch_dim
+        self._batch_size = batch_size
+        self._batch_years = batch_years
         self._cache = {}
         self._kv = {}
 
@@ -173,36 +188,106 @@ class PolytopeZarrStore(MutableMapping):
 
     # ── Lazy chunk fetching ─────────────────────────────────────────────
 
+    def _chunk_key_for_indices(self, indices):
+        """Build a dotted chunk key from a list of integer indices."""
+        return ".".join(str(i) for i in indices)
+
     def _fetch_chunk(self, var_name, chunk_key):
-        """Translate a zarr chunk key into a Polytope request and fetch data."""
+        """Fetch one or more chunks via a batched Polytope request.
+
+        When batch_dim is set (default: "time"), this looks for other
+        uncached indices along that dimension and fetches up to batch_size
+        of them in a single Polytope call (e.g. month=1/2/3/.../12).
+        Results are split and cached individually.
+        """
         spec = self._variables[var_name]
         dims = spec["dims"]
         indices = [int(i) for i in chunk_key.split(".")]
 
+        # Identify the batch dimension position
+        batch_pos = None
+        if self._batch_dim and self._batch_dim in dims:
+            batch_pos = list(dims).index(self._batch_dim)
+            if self._batch_dim in self._internal_dims:
+                batch_pos = None  # can't batch over an internal dim
+
+        # Collect batch indices: uncached neighbours along batch_dim
+        if batch_pos is not None:
+            batch_indices = []
+            dim_size = self._dim_sizes[self._batch_dim]
+
+            # For time batching, collect uncached months within a year range
+            # controlled by batch_years.  Polytope treats multi-value year/month
+            # as a Cartesian product; metadata-based splitting handles this.
+            if self._batch_dim == "time":
+                ref_year = pd.Timestamp(self._coords["time"][indices[batch_pos]]).year
+                max_year = ref_year + self._batch_years - 1
+                max_total = self._batch_size * self._batch_years
+                for i in range(dim_size):
+                    ts_year = pd.Timestamp(self._coords["time"][i]).year
+                    if ts_year < ref_year or ts_year > max_year:
+                        continue
+                    trial = list(indices)
+                    trial[batch_pos] = i
+                    trial_key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    if trial_key not in self._cache:
+                        batch_indices.append(i)
+                    if len(batch_indices) >= max_total:
+                        break
+            else:
+                for i in range(dim_size):
+                    trial = list(indices)
+                    trial[batch_pos] = i
+                    trial_key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    if trial_key not in self._cache:
+                        batch_indices.append(i)
+                    if len(batch_indices) >= self._batch_size:
+                        break
+
+            # Ensure the originally requested index is included
+            if indices[batch_pos] not in batch_indices:
+                batch_indices.append(indices[batch_pos])
+                batch_indices.sort()
+        else:
+            batch_indices = None
+
+        # Build the Polytope request
         request = dict(self._base_request)
         request["param"] = var_name
         chunk_shape = []
 
-        for dim, idx in zip(dims, indices):
+        for dim_i, (dim, idx) in enumerate(zip(dims, indices)):
             size = self._dim_sizes[dim]
             if dim in self._internal_dims:
                 chunk_shape.append(size)
                 continue
-            coord_val = self._coords[dim][idx]
             chunk_shape.append(1)
 
-            if dim == "time":
-                ts = pd.Timestamp(coord_val)
+            if dim == "time" and dim_i == batch_pos and batch_indices is not None:
+                # Batched time request
+                timestamps = [pd.Timestamp(self._coords["time"][bi])
+                              for bi in batch_indices]
+                field_map_all = {}
+                for ts in timestamps:
+                    fm = {"year": str(ts.year), "month": str(ts.month),
+                          "day": str(ts.day), "time": ts.strftime("%H:%M")}
+                    for f in self._time_fields:
+                        field_map_all.setdefault(f, []).append(fm[f])
+                for f in self._time_fields:
+                    request[f] = "/".join(dict.fromkeys(field_map_all[f]))
+            elif dim == "time":
+                ts = pd.Timestamp(self._coords["time"][idx])
                 field_map = {"year": str(ts.year), "month": str(ts.month),
                              "day": str(ts.day),
                              "time": ts.strftime("%H:%M")}
                 for f in self._time_fields:
                     request[f] = field_map[f]
             elif dim == "model":
-                request["model"] = str(coord_val)
+                request["model"] = str(self._coords["model"][idx])
             elif dim == "level":
-                request["levelist"] = str(int(coord_val))
+                request["levelist"] = str(int(self._coords["level"][idx]))
             else:
+                coord_val = self._coords[dim][idx]
                 request[dim] = str(coord_val)
 
         # Resolve address
@@ -211,24 +296,136 @@ class PolytopeZarrStore(MutableMapping):
             model = request.get("model", "")
             address = address.get(model, list(address.values())[0])
 
-        total = 1
+        n_cells = 1
         for s in chunk_shape:
-            total *= s
+            n_cells *= s
+
+        n_batch = len(batch_indices) if batch_indices is not None else 1
+        if n_batch > 1:
+            if self._batch_dim == "time" and batch_indices is not None:
+                yrs = set(pd.Timestamp(self._coords["time"][bi]).year
+                          for bi in batch_indices)
+                yr_info = f" across {len(yrs)} years" if len(yrs) > 1 else ""
+            else:
+                yr_info = ""
+            print(f"  ⚡ batching {n_batch} {self._batch_dim} chunks{yr_info} for {var_name}")
 
         try:
             import earthkit.data
             data = earthkit.data.from_source(
                 "polytope", self._collection, request,
                 address=address, stream=False)
-            values = data.to_numpy().flatten().astype(np.float32)
-            if values.size != total:
-                raise ValueError(
-                    f"Size mismatch: got {values.size}, expected {total}")
+
+            if batch_indices is not None and n_batch > 1:
+                # Split the multi-field response into individual chunks
+                self._split_batch(var_name, dims, indices, batch_pos,
+                                  batch_indices, chunk_shape, data)
+            else:
+                values = data.to_numpy().flatten().astype(np.float32)
+                if values.size != n_cells:
+                    raise ValueError(
+                        f"Size mismatch: got {values.size}, expected {n_cells}")
+                store_key = f"{var_name}/{chunk_key}"
+                self._cache[store_key] = values.tobytes()
+
         except Exception as e:
             print(f"  ⚠ fetch {var_name} chunk {chunk_key}: {e}")
-            values = np.full(total, np.nan, dtype=np.float32)
+            # Fill all batch indices with NaN on failure
+            if batch_indices is not None:
+                for bi in batch_indices:
+                    trial = list(indices)
+                    trial[batch_pos] = bi
+                    key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    if key not in self._cache:
+                        self._cache[key] = np.full(
+                            n_cells, np.nan, dtype=np.float32).tobytes()
+            else:
+                self._cache[f"{var_name}/{chunk_key}"] = np.full(
+                    n_cells, np.nan, dtype=np.float32).tobytes()
 
-        return values.tobytes()
+        return self._cache.get(f"{var_name}/{chunk_key}",
+                               np.full(n_cells, np.nan, dtype=np.float32).tobytes())
+
+    def _split_batch(self, var_name, dims, indices, batch_pos,
+                     batch_indices, chunk_shape, data):
+        """Split a multi-field earthkit response into per-chunk cache entries."""
+        n_cells = 1
+        for s in chunk_shape:
+            n_cells *= s
+
+        fields = list(data)
+
+        # ── Time dimension: match fields by year/month metadata ─────────
+        if self._batch_dim == "time" and dims[batch_pos] == "time":
+            # Build lookup: (year, month) → time-axis index
+            time_lookup = {}
+            for bi in batch_indices:
+                ts = pd.Timestamp(self._coords["time"][bi])
+                time_lookup[(ts.year, ts.month)] = bi
+
+            matched = set()
+            for field in fields:
+                try:
+                    yr = int(field.metadata("year"))
+                    mo = int(field.metadata("month"))
+                except Exception:
+                    continue
+                key_tuple = (yr, mo)
+                if key_tuple in time_lookup and key_tuple not in matched:
+                    bi = time_lookup[key_tuple]
+                    matched.add(key_tuple)
+                    trial = list(indices)
+                    trial[batch_pos] = bi
+                    key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    values = field.to_numpy().flatten().astype(np.float32)
+                    if values.size == n_cells:
+                        self._cache[key] = values.tobytes()
+                    else:
+                        self._cache[key] = np.full(
+                            n_cells, np.nan, dtype=np.float32).tobytes()
+
+            # Fill any unmatched batch indices with NaN
+            for bi in batch_indices:
+                trial = list(indices)
+                trial[batch_pos] = bi
+                key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                if key not in self._cache:
+                    self._cache[key] = np.full(
+                        n_cells, np.nan, dtype=np.float32).tobytes()
+            return
+
+        # ── Non-time dimensions: ordered matching ───────────────────────
+        if len(fields) == len(batch_indices):
+            for bi, field in zip(batch_indices, fields):
+                trial = list(indices)
+                trial[batch_pos] = bi
+                key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                values = field.to_numpy().flatten().astype(np.float32)
+                if values.size == n_cells:
+                    self._cache[key] = values.tobytes()
+                else:
+                    self._cache[key] = np.full(
+                        n_cells, np.nan, dtype=np.float32).tobytes()
+        else:
+            # Fallback: treat entire response as a single concatenated array
+            all_values = data.to_numpy().flatten().astype(np.float32)
+            expected = n_cells * len(batch_indices)
+            if all_values.size == expected:
+                for i, bi in enumerate(batch_indices):
+                    trial = list(indices)
+                    trial[batch_pos] = bi
+                    key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    chunk = all_values[i * n_cells:(i + 1) * n_cells]
+                    self._cache[key] = chunk.tobytes()
+            else:
+                print(f"  ⚠ batch split: got {all_values.size} values, "
+                      f"expected {expected} ({len(batch_indices)} x {n_cells})")
+                for bi in batch_indices:
+                    trial = list(indices)
+                    trial[batch_pos] = bi
+                    key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                    self._cache[key] = np.full(
+                        n_cells, np.nan, dtype=np.float32).tobytes()
 
     # ── MutableMapping interface ────────────────────────────────────────
 
@@ -242,9 +439,7 @@ class PolytopeZarrStore(MutableMapping):
             parts = key.split("/", 1)
             var_name, chunk_key = parts[0], parts[1]
             if var_name in self._variables and "." in chunk_key:
-                data = self._fetch_chunk(var_name, chunk_key)
-                self._cache[key] = data
-                return data
+                return self._fetch_chunk(var_name, chunk_key)
         raise KeyError(key)
 
     def __setitem__(self, key, value):
@@ -287,10 +482,26 @@ class PolytopeZarrStore(MutableMapping):
 
     # ── Convenience ─────────────────────────────────────────────────────
 
+    @property
+    def batch_years(self):
+        return self._batch_years
+
+    @batch_years.setter
+    def batch_years(self, value):
+        self._batch_years = int(value)
+
     def open(self):
-        """Open this store as an xarray Dataset (lazy — no data fetched)."""
+        """Open this store as an xarray Dataset (lazy — no data fetched).
+
+        The returned Dataset (and its DataArrays) carry a reference to this
+        store so that ``.polytope.sel()`` can auto-tune ``batch_years``.
+        """
         import xarray as xr
-        return xr.open_dataset(self, engine="zarr", consolidated=True)
+        ds = xr.open_dataset(self, engine="zarr", consolidated=True)
+        ds.attrs["_polytope_store"] = self
+        for name in ds.data_vars:
+            ds[name].attrs["_polytope_store"] = self
+        return ds
 
     def clear_cache(self):
         """Free cached data chunks."""
@@ -300,3 +511,47 @@ class PolytopeZarrStore(MutableMapping):
         dims = ", ".join(f"{k}={v}" for k, v in self._dim_sizes.items())
         nvars = len(self._variables)
         return f"<PolytopeZarrStore {nvars} variables ({dims})>"
+
+
+# ── xarray accessor: .polytope.sel() ────────────────────────────────────
+
+def _infer_batch_years(store, sel_kwargs):
+    """Set store.batch_years to span the requested time slice."""
+    time_arg = sel_kwargs.get("time")
+    if store is None or time_arg is None:
+        return
+    if isinstance(time_arg, slice):
+        start = pd.Timestamp(time_arg.start) if time_arg.start else None
+        stop = pd.Timestamp(time_arg.stop) if time_arg.stop else None
+        if start is not None and stop is not None:
+            store.batch_years = stop.year - start.year + 1
+
+
+try:
+    import xarray as _xr
+
+    @_xr.register_dataarray_accessor("polytope")
+    class _PolytopeDataArray:
+        def __init__(self, da):
+            self._da = da
+            self._store = da.attrs.get("_polytope_store")
+
+        def sel(self, **kwargs):
+            """Like ``.sel()``, but auto-sets batch_years from the time slice."""
+            _infer_batch_years(self._store, kwargs)
+            return self._da.sel(**kwargs)
+
+    @_xr.register_dataset_accessor("polytope")
+    class _PolytopeDataset:
+        def __init__(self, ds):
+            self._ds = ds
+            self._store = ds.attrs.get("_polytope_store")
+
+        def sel(self, var=None, **kwargs):
+            """Like ``.sel()``, but auto-sets batch_years from the time slice."""
+            _infer_batch_years(self._store, kwargs)
+            result = self._ds.sel(**kwargs)
+            return result[var] if var is not None else result
+
+except ImportError:
+    pass

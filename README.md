@@ -1,7 +1,8 @@
 # DestinE Climate Change Analysis
 
-Analyse climate change signals from **DestinE Climate DT Generation 2** simulations.
-Downloads monthly data (`clmn` stream) via Earthkit and [Polytope](https://github.com/ecmwf/polytope-client), computes 30-year mean differences between historical and SSP3-7.0 scenario experiments, and plots the results on the HEALPix grid.
+Analyse climate change signals from **DestinE Climate DT Generation 2** simulations and browse the whole Climate DT catalogue via streaming.
+The first example downloads monthly data (`clmn` stream) via Earthkit and [Polytope](https://github.com/ecmwf/polytope-client), computes 30-year mean differences between historical and SSP3-7.0 scenario experiments, and plots the results on the HEALPix grid.
+The second example opens the full Generation 2 portfolio as a lazy xarray Dataset: monthly data are streamed on access and not saved to disk. Batched multi-year requests (via `.polytope.sel()`) make it efficient enough for full climate change analysis, entirely via streaming.
 
 Supports the three Climate DT models **IFS-NEMO**, **IFS-FESOM**, and **ICON**.
 
@@ -14,14 +15,25 @@ git clone https://github.com/trackow/polytope-climatedt-analysis.git
 cd polytope-climate-analysis
 ```
 
+> **`auto-batch` branch:** For the latest developments, automatic multi-year batching
+> via `.polytope.sel()`, the xarray accessor, and a `requirements.txt` with version pins,
+> switch to the `auto-batch` branch:
+> ```bash
+> git checkout auto-batch
+> ```
+> This extends `polytope_zarr.py` (~560 lines vs ~290 on `main`) with data
+> prefetching, GRIB metadata-based batch splitting, and an xarray accessor that
+> automatically infers an optimal batch size for Polytope from your time slice.  See [STORE.md](STORE.md) for a full walkthrough.
+
 ### 2. Set up the Python environment
 
 **Option A: Using conda**
 
 ```bash
-conda create -n destine-analysis python=3.13
+conda create -n destine-analysis python=3.13 -c conda-forge
 conda activate destine-analysis
-pip install earthkit-data healpy matplotlib numpy xarray pandas netcdf4 polytope-client ipykernel conflator lxml pydantic zarr numcodecs
+conda install -c conda-forge healpy cartopy matplotlib numpy xarray pandas netcdf4 ipykernel "zarr>=2.18,<3" "numcodecs<0.16"
+pip install earthkit-data polytope-client conflator lxml pydantic
 ```
 
 **Option B: Using venv (no conda required)**
@@ -29,10 +41,13 @@ pip install earthkit-data healpy matplotlib numpy xarray pandas netcdf4 polytope
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install earthkit-data healpy matplotlib numpy xarray pandas netcdf4 polytope-client ipykernel conflator lxml pydantic zarr numcodecs
+pip install -r requirements.txt
 ```
 
-If you are running on the **DESP**, the packages may already be available. Just make sure your kernel has `earthkit-data` and `healpy` installed.
+> **Important:** `polytope_zarr.py` requires **zarr v2** (`zarr>=2.18,<3`) and `numcodecs<0.16`.
+> These pins are included in `requirements.txt`.  Installing zarr v3 will cause a `TypeError: Unsupported type for store_like` error.
+
+If you are running on the **DESP**, the packages may already be available. Just make sure your kernel has `earthkit-data` and `healpy` installed, and that `zarr<3` is pinned.
 
 ### 3. Authenticate (once per session)
 
@@ -59,10 +74,10 @@ The Configuration is in the beginning: you can change models, variables, time pe
 
 Open **`03_lazy_browse_portfolio.ipynb`**. This notebook:
 
-1. Opens the entire Climate DT monthly portfolio as an **instant xarray Dataset** — no data is downloaded
+1. Opens the entire Climate DT monthly portfolio as an **instant xarray Dataset**, no data is downloaded
 2. Variables, coordinates, and attributes appear immediately
-3. Data is fetched from Polytope **only when you access values** (e.g. plotting, `.values`, `.compute()`)
-4. Supports all 6 levtypes: `sfc`, `pl`, `hl`, `sol`, `o2d`, `o3d` — just uncomment the desired `LEVTYPE` in the configuration cell
+3. Data is fetched via Polytope **only when you access values** (e.g. plotting, `.values`, `.compute()`)
+4. Supports all 6 levtypes: `sfc`, `pl`, `hl`, `sol`, `o2d`, `o3d`: just uncomment the desired `LEVTYPE` in the configuration cell
 
 The variable catalogue is defined in `destine_portfolio.py` (65 variables across all levtypes).
 
@@ -82,6 +97,7 @@ The variable catalogue is defined in `destine_portfolio.py` (65 variables across
 | `destine_climate_helpers.py` | Helper module (polytope request handling, caching, data retrieval, chunking over years) |
 | `destine_portfolio.py` | Data portfolio — 65 variables across 6 levtypes (`sfc`, `pl`, `hl`, `sol`, `o2d`, `o3d`) |
 | `polytope_zarr.py` | Virtual zarr store backed by Polytope (lazy chunk fetching) |
+| `requirements.txt` | Python dependencies with version pins (zarr v2, numcodecs) |
 
 ## Configuration options
 
