@@ -1,4 +1,5 @@
 earthkit-data
+covjsonkit
 healpy
 matplotlib
 numpy

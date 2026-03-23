@@ -17,6 +17,7 @@ import logging
 import numpy as np
 import pandas as pd
 from collections.abc import MutableMapping
+from contextlib import contextmanager
 
 # Try to import VLenUTF8 for proper string coordinates
 try:
@@ -26,12 +27,159 @@ except ImportError:
     _HAS_VLENUTF8 = False
 
 
+@contextmanager
+def _quiet_polytope_loggers():
+    """Temporarily silence polytope/earthkit loggers during a Polytope request.
+
+    The polytope Client creates per-instance child loggers with their own
+    StreamHandlers at INFO level (bypassing parent logger settings).
+    We set the *parent* logger level to WARNING so that newly-created child
+    loggers (level NOTSET) inherit it and never process INFO messages, then
+    also walk existing loggers to raise handler levels directly.
+    """
+    def _suppress():
+        prefix = ("polytope", "earthkit")
+        # Set parent logger level so new children inherit WARNING
+        for p in prefix:
+            logging.getLogger(p).setLevel(logging.WARNING)
+        # Silence handlers on any existing child loggers
+        for name, lg in logging.Logger.manager.loggerDict.items():
+            if isinstance(lg, logging.Logger) and name.startswith(prefix):
+                lg.setLevel(logging.WARNING)
+                for h in lg.handlers:
+                    if isinstance(h, logging.StreamHandler) and h.level < logging.WARNING:
+                        h.setLevel(logging.WARNING)
+    _suppress()
+    try:
+        yield
+    finally:
+        _suppress()
+
+
 class PolytopeZarrStore(MutableMapping):
     """A read-only zarr v2 store that fetches data from Polytope on demand."""
 
+    # ── Factory classmethod ──────────────────────────────────────────
+
+    @classmethod
+    def from_climate_dt(cls, models, experiment, levtype,
+                        frequency="monthly",
+                        years=None,
+                        start_date=None, end_date=None,
+                        resolution="standard",
+                        realization=1):
+        """Create a store for DestinE Climate DT Generation 2 data.
+
+        Parameters
+        ----------
+        models : list of str
+            Model names, e.g. ["ICON", "IFS-FESOM", "IFS-NEMO"].
+        experiment : str
+            "hist", "cont", or "SSP3-7.0".
+        levtype : str
+            "sfc", "pl", "hl", "sol", "o2d", or "o3d".
+        frequency : str, optional
+            "monthly" (clmn stream, default) or "hourly" (clte stream).
+        years : range or list, optional
+            Years to include.  Required when *frequency* = "monthly".
+        start_date, end_date : str, optional
+            ISO date strings (e.g. "2020-01-01").  Required when
+            *frequency* = "hourly".
+        resolution : str, optional
+            "standard" (nside 128) or "high" (nside 1024).  Default "standard".
+        realization : int, optional
+            Realization number.  Default 1.
+
+        Returns
+        -------
+        PolytopeZarrStore
+        """
+        from destine_portfolio import PORTFOLIO_GEN2_CLMN, PORTFOLIO_GEN2_CLTE
+
+        # Validate frequency / time args
+        if frequency == "monthly":
+            if years is None:
+                raise ValueError("years is required when frequency='monthly'")
+            stream = "clmn"
+            portfolio = PORTFOLIO_GEN2_CLMN
+        elif frequency == "hourly":
+            if start_date is None or end_date is None:
+                raise ValueError(
+                    "start_date and end_date are required when frequency='hourly'")
+            stream = "clte"
+            portfolio = PORTFOLIO_GEN2_CLTE
+        else:
+            raise ValueError(f"frequency must be 'monthly' or 'hourly', got {frequency!r}")
+
+        # Derived parameters
+        nside = 128 if resolution == "standard" else 1024
+        n_cells = 12 * nside ** 2
+        activity = "baseline" if experiment in ("hist", "cont") else "projections"
+        address = {m: ("polytope.mn5.apps.dte.destination-earth.eu"
+                       if m == "IFS-NEMO" else
+                       "polytope.lumi.apps.dte.destination-earth.eu")
+                   for m in models}
+
+        # Portfolio lookup
+        lt = portfolio[levtype]
+
+        # Time axis & request fields from portfolio freq
+        freq = lt["freq"]  # "MS", "h", or "D"
+        if freq == "MS":
+            time_axis = pd.date_range(
+                f"{min(years)}-01", f"{max(years)}-12", freq="MS")
+            time_fields = ["year", "month"]
+            batch_size = 12
+        elif freq == "h":
+            time_axis = pd.date_range(start_date, end_date, freq="h")
+            time_fields = ["date", "time"]
+            batch_size = 24
+        elif freq == "D":
+            time_axis = pd.date_range(start_date, end_date, freq="D")
+            time_fields = ["date", "time"]
+            batch_size = 1
+        else:
+            raise ValueError(f"Unknown portfolio freq {freq!r}")
+
+        # Coordinates
+        coords = {"time": time_axis, "cell": range(n_cells), "model": models}
+        if lt["levels"] is not None:
+            coords["level"] = lt["levels"]
+
+        base_request = {
+            "class": "d1",
+            "dataset": "climate-dt",
+            "type": "fc",
+            "expver": "0001",
+            "generation": "2",
+            "realization": str(realization),
+            "activity": activity,
+            "experiment": experiment,
+            "levtype": lt["levtype"],
+            "resolution": resolution,
+            "stream": stream,
+        }
+
+        store = cls(
+            address=address,
+            collection="destination-earth",
+            base_request=base_request,
+            coords=coords,
+            variables=lt["variables"],
+            internal_dims=["cell"],
+            time_fields=time_fields,
+            batch_size=batch_size,
+        )
+        store._frequency = frequency
+        store._freq = freq  # "MS", "h", or "D" — from portfolio
+        store._resolution = resolution
+        return store
+
+    # ── Constructor ──────────────────────────────────────────────────
+
     def __init__(self, address, collection, base_request, coords, variables,
                  internal_dims=None, time_fields=None, batch_dim="time",
-                 batch_size=12, batch_years=1):
+                 batch_size=12, batch_years=1, batch_days=1):
         """
         Parameters
         ----------
@@ -55,13 +203,14 @@ class PolytopeZarrStore(MutableMapping):
             Dimension to batch over in a single Polytope request.  Default "time".
             Set to None to disable batching (one request per chunk).
         batch_size : int, optional
-            Maximum number of months per year to fetch in one request.
-            Default 12 (= all months of each year).
+            Maximum number of time steps per batch unit to fetch in one request.
+            Default 12 (= all months of each year for monthly stores).
         batch_years : int, optional
-            Maximum number of years to combine in a single Polytope request
-            (only applies when batch_dim="time").  Default 1 — batch only
-            within the same calendar year.  Set to 5 or more for multi-year
-            slices; note that higher values pre-fetch more data on first access.
+            For **monthly** stores: maximum number of calendar years to combine
+            in a single Polytope request.  Default 1.
+        batch_days : int, optional
+            For **hourly** stores: maximum number of calendar days to combine
+            in a single Polytope request.  Default 1.
         """
         self._address = address
         self._collection = collection
@@ -71,6 +220,9 @@ class PolytopeZarrStore(MutableMapping):
         self._batch_dim = batch_dim
         self._batch_size = batch_size
         self._batch_years = batch_years
+        self._batch_days = batch_days
+        self._frequency = getattr(self, '_frequency', 'monthly')  # set by factory
+        self._freq = getattr(self, '_freq', None)  # "MS", "h", "D" — set by factory
         self._cache = {}
         self._kv = {}
 
@@ -186,6 +338,19 @@ class PolytopeZarrStore(MutableMapping):
                               dtype=data.dtype.str, fill_value="")
         return zarray, data.tobytes()
 
+    # ── Time helpers ─────────────────────────────────────────────────────
+
+    def _time_to_fields(self, ts):
+        """Convert a pandas Timestamp to a dict of Polytope request fields."""
+        freq = getattr(self, '_freq', None)
+        if freq == "h":
+            return {"date": ts.strftime("%Y%m%d"), "time": ts.strftime("%H%M")}
+        if freq == "D":
+            return {"date": ts.strftime("%Y%m%d"), "time": "0000"}
+        # monthly (freq == "MS" or legacy)
+        return {"year": str(ts.year), "month": str(ts.month),
+                "day": str(ts.day), "time": ts.strftime("%H:%M")}
+
     # ── Lazy chunk fetching ─────────────────────────────────────────────
 
     def _chunk_key_for_indices(self, indices):
@@ -216,24 +381,40 @@ class PolytopeZarrStore(MutableMapping):
             batch_indices = []
             dim_size = self._dim_sizes[self._batch_dim]
 
-            # For time batching, collect uncached months within a year range
-            # controlled by batch_years.  Polytope treats multi-value year/month
-            # as a Cartesian product; metadata-based splitting handles this.
+            # For time batching, collect uncached neighbours within a range.
+            # Hourly stores use batch_days; monthly stores use batch_years.
             if self._batch_dim == "time":
-                ref_year = pd.Timestamp(self._coords["time"][indices[batch_pos]]).year
-                max_year = ref_year + self._batch_years - 1
-                max_total = self._batch_size * self._batch_years
-                for i in range(dim_size):
-                    ts_year = pd.Timestamp(self._coords["time"][i]).year
-                    if ts_year < ref_year or ts_year > max_year:
-                        continue
-                    trial = list(indices)
-                    trial[batch_pos] = i
-                    trial_key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
-                    if trial_key not in self._cache:
-                        batch_indices.append(i)
-                    if len(batch_indices) >= max_total:
-                        break
+                ref_ts = pd.Timestamp(self._coords["time"][indices[batch_pos]])
+                if self._frequency == "hourly":
+                    ref_date = ref_ts.normalize()
+                    max_date = ref_date + pd.Timedelta(days=self._batch_days - 1)
+                    max_total = self._batch_size * self._batch_days
+                    for i in range(dim_size):
+                        ts_date = pd.Timestamp(self._coords["time"][i]).normalize()
+                        if ts_date < ref_date or ts_date > max_date:
+                            continue
+                        trial = list(indices)
+                        trial[batch_pos] = i
+                        trial_key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                        if trial_key not in self._cache:
+                            batch_indices.append(i)
+                        if len(batch_indices) >= max_total:
+                            break
+                else:
+                    ref_year = ref_ts.year
+                    max_year = ref_year + self._batch_years - 1
+                    max_total = self._batch_size * self._batch_years
+                    for i in range(dim_size):
+                        ts_year = pd.Timestamp(self._coords["time"][i]).year
+                        if ts_year < ref_year or ts_year > max_year:
+                            continue
+                        trial = list(indices)
+                        trial[batch_pos] = i
+                        trial_key = f"{var_name}/{self._chunk_key_for_indices(trial)}"
+                        if trial_key not in self._cache:
+                            batch_indices.append(i)
+                        if len(batch_indices) >= max_total:
+                            break
             else:
                 for i in range(dim_size):
                     trial = list(indices)
@@ -269,19 +450,16 @@ class PolytopeZarrStore(MutableMapping):
                               for bi in batch_indices]
                 field_map_all = {}
                 for ts in timestamps:
-                    fm = {"year": str(ts.year), "month": str(ts.month),
-                          "day": str(ts.day), "time": ts.strftime("%H:%M")}
+                    fm = self._time_to_fields(ts)
                     for f in self._time_fields:
                         field_map_all.setdefault(f, []).append(fm[f])
                 for f in self._time_fields:
                     request[f] = "/".join(dict.fromkeys(field_map_all[f]))
             elif dim == "time":
                 ts = pd.Timestamp(self._coords["time"][idx])
-                field_map = {"year": str(ts.year), "month": str(ts.month),
-                             "day": str(ts.day),
-                             "time": ts.strftime("%H:%M")}
+                fm = self._time_to_fields(ts)
                 for f in self._time_fields:
-                    request[f] = field_map[f]
+                    request[f] = fm[f]
             elif dim == "model":
                 request["model"] = str(self._coords["model"][idx])
             elif dim == "level":
@@ -312,9 +490,10 @@ class PolytopeZarrStore(MutableMapping):
 
         try:
             import earthkit.data
-            data = earthkit.data.from_source(
-                "polytope", self._collection, request,
-                address=address, stream=False)
+            with _quiet_polytope_loggers():
+                data = earthkit.data.from_source(
+                    "polytope", self._collection, request,
+                    address=address, stream=False)
 
             if batch_indices is not None and n_batch > 1:
                 # Split the multi-field response into individual chunks
@@ -355,22 +534,31 @@ class PolytopeZarrStore(MutableMapping):
 
         fields = list(data)
 
-        # ── Time dimension: match fields by year/month metadata ─────────
+        # ── Time dimension: match fields by metadata ────────────────────
         if self._batch_dim == "time" and dims[batch_pos] == "time":
-            # Build lookup: (year, month) → time-axis index
+            # Build lookup: time-key tuple → time-axis index
             time_lookup = {}
-            for bi in batch_indices:
-                ts = pd.Timestamp(self._coords["time"][bi])
-                time_lookup[(ts.year, ts.month)] = bi
+            if self._frequency == "hourly":
+                meta_keys = ("date", "time")
+                for bi in batch_indices:
+                    ts = pd.Timestamp(self._coords["time"][bi])
+                    time_lookup[(ts.strftime("%Y%m%d"), ts.strftime("%H%M"))] = bi
+            else:
+                meta_keys = ("year", "month")
+                for bi in batch_indices:
+                    ts = pd.Timestamp(self._coords["time"][bi])
+                    time_lookup[(ts.year, ts.month)] = bi
 
             matched = set()
             for field in fields:
                 try:
-                    yr = int(field.metadata("year"))
-                    mo = int(field.metadata("month"))
+                    vals = tuple(
+                        int(field.metadata(k)) if k in ("year", "month")
+                        else str(field.metadata(k))
+                        for k in meta_keys)
                 except Exception:
                     continue
-                key_tuple = (yr, mo)
+                key_tuple = vals
                 if key_tuple in time_lookup and key_tuple not in matched:
                     bi = time_lookup[key_tuple]
                     matched.add(key_tuple)
@@ -484,17 +672,27 @@ class PolytopeZarrStore(MutableMapping):
 
     @property
     def batch_years(self):
+        """Number of calendar years per batch (monthly stores)."""
         return self._batch_years
 
     @batch_years.setter
     def batch_years(self, value):
         self._batch_years = int(value)
 
+    @property
+    def batch_days(self):
+        """Number of calendar days per batch (hourly stores)."""
+        return self._batch_days
+
+    @batch_days.setter
+    def batch_days(self, value):
+        self._batch_days = int(value)
+
     def open(self):
         """Open this store as an xarray Dataset (lazy — no data fetched).
 
         The returned Dataset (and its DataArrays) carry a reference to this
-        store so that ``.polytope.sel()`` can auto-tune ``batch_years``.
+        store so that ``.polytope.sel()`` can auto-tune batching.
         """
         import xarray as xr
         ds = xr.open_dataset(self, engine="zarr", consolidated=True)
@@ -515,8 +713,16 @@ class PolytopeZarrStore(MutableMapping):
 
 # ── xarray accessor: .polytope.sel() ────────────────────────────────────
 
-def _infer_batch_years(store, sel_kwargs):
-    """Set store.batch_years to span the requested time slice."""
+def _infer_batch_window(store, sel_kwargs):
+    """Auto-tune batch_days or batch_years to span the requested time slice.
+
+    For hourly/daily stores (freq "h" or "D"), batch_days is capped to avoid
+    exceeding Polytope request-size limits (~500 MB):
+      - standard resolution: max 31 days  (~245 MB hourly, ~250 MB daily)
+      - high resolution:     max  1 day   (~502 MB hourly)
+
+    For monthly stores, batch_years spans the full requested year range.
+    """
     time_arg = sel_kwargs.get("time")
     if store is None or time_arg is None:
         return
@@ -524,7 +730,122 @@ def _infer_batch_years(store, sel_kwargs):
         start = pd.Timestamp(time_arg.start) if time_arg.start else None
         stop = pd.Timestamp(time_arg.stop) if time_arg.stop else None
         if start is not None and stop is not None:
-            store.batch_years = stop.year - start.year + 1
+            freq = getattr(store, '_freq', None)
+            if freq in ("h", "D"):
+                span_days = (stop.normalize() - start.normalize()).days + 1
+                res = getattr(store, '_resolution', 'standard')
+                max_days = 31 if res == 'standard' else 1
+                store.batch_days = min(span_days, max_days)
+            else:
+                store.batch_years = stop.year - start.year + 1
+
+
+def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
+                 **sel_kwargs):
+    """Execute a server-side Polytope feature request.
+
+    Feature requests use the ``clte`` stream (instantaneous forecast fields)
+    and return data on a lat/lon grid — **not** the HEALPix grid used by the
+    zarr store's ``clmn`` monthly-mean data.
+
+    Parameters
+    ----------
+    store : PolytopeZarrStore
+    var_name : str
+        Variable / param name (e.g. ``"avg_2t"``).
+    bbox : (south, west, north, east)
+        Bounding-box corners in degrees.  Supports single dates and date
+        ranges (``time=slice(...)``).  Returns a ``points`` dimension with
+        ``latitude``/``longitude`` coordinates.
+    polygon : list of (lat, lon)
+        Polygon vertices.  Same date handling as *bbox*.
+    point : (lat, lon)
+        Single location for a timeseries extraction.  Supports date ranges
+        via ``time=slice(...)``.  Returns a ``t`` time dimension.
+    **sel_kwargs
+        ``model``, ``time``, ``level`` — forwarded into the Polytope request.
+    """
+    import earthkit.data
+
+    if store is None:
+        raise ValueError(
+            "No PolytopeZarrStore attached — open the dataset via store.open().")
+
+    request = dict(store._base_request)
+    # Features require the clte stream
+    if request.get("stream") != "clte":
+        request["stream"] = "clte"
+    # Remove time-specific fields; replaced by date below
+    for f in store._time_fields:
+        request.pop(f, None)
+
+    request["param"] = var_name
+
+    if "model" in sel_kwargs:
+        request["model"] = str(sel_kwargs["model"])
+    if "level" in sel_kwargs:
+        request["levelist"] = str(int(sel_kwargs["level"]))
+
+    # ── time → date + time conversion ─────────────────────────────────
+    # For date ranges, MARS forms the Cartesian product of date × time,
+    # so we list all 24 hours.  For a single timestamp, just that hour.
+    _ALL_HOURS = "/".join(f"{h:02d}00" for h in range(24))
+
+    time_arg = sel_kwargs.get("time")
+    if isinstance(time_arg, slice):
+        t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
+        t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
+        date_str = f"{t0.strftime('%Y%m%d')}/to/{t1.strftime('%Y%m%d')}"
+        time_str = _ALL_HOURS
+    elif time_arg is not None:
+        ts = pd.Timestamp(time_arg)
+        date_str = ts.strftime("%Y%m%d")
+        time_str = ts.strftime("%H%M")
+    else:
+        ts = pd.Timestamp(store._coords["time"][0])
+        date_str = ts.strftime("%Y%m%d")
+        time_str = ts.strftime("%H%M")
+    request["date"] = date_str
+
+    # ── feature dict ────────────────────────────────────────────────
+    if bbox is not None:
+        south, west, north, east = bbox
+        request["time"] = time_str
+        request["feature"] = {
+            "type": "boundingbox",
+            "points": [[north, west], [south, east]],
+        }
+    elif polygon is not None:
+        request["time"] = time_str
+        request["feature"] = {
+            "type": "polygon",
+            "shape": [list(pt) for pt in polygon],
+        }
+    elif point is not None:
+        lat, lon = point
+        request["time"] = time_str
+        request["feature"] = {
+            "type": "timeseries",
+            "points": [[lat, lon]],
+            "time_axis": "date",
+        }
+
+    # ── resolve address & fetch ─────────────────────────────────────
+    address = store._address
+    if isinstance(address, dict):
+        m = request.get("model", "")
+        address = address.get(m, list(address.values())[0])
+
+    ftype = request["feature"]["type"]
+    logging.getLogger(__name__).info(
+        "%s request for %s (%s)", ftype, var_name, date_str)
+    print(f"  🌍 {ftype} request for {var_name} ({date_str})")
+
+    with _quiet_polytope_loggers():
+        data = earthkit.data.from_source(
+            "polytope", store._collection, request,
+            address=address, stream=False)
+    return data.to_xarray()
 
 
 try:
@@ -536,9 +857,23 @@ try:
             self._da = da
             self._store = da.attrs.get("_polytope_store")
 
-        def sel(self, **kwargs):
-            """Like ``.sel()``, but auto-sets batch_years from the time slice."""
-            _infer_batch_years(self._store, kwargs)
+        def sel(self, *, bbox=None, polygon=None, point=None, **kwargs):
+            """Select data, with optional server-side spatial subsetting.
+
+            When *bbox*, *polygon*, or *point* is given the request is
+            executed as a Polytope **feature** (``clte`` stream, lat/lon
+            grid).  Otherwise delegates to the normal ``.sel()`` with
+            automatic batch tuning.
+            """
+            if bbox is not None or polygon is not None or point is not None:
+                if self._store and getattr(self._store, '_frequency', 'monthly') == 'monthly':
+                    raise ValueError(
+                        "Spatial features (bbox, polygon, point) require "
+                        "frequency='hourly' (clte stream)")
+                return _feature_sel(
+                    self._store, self._da.name,
+                    bbox=bbox, polygon=polygon, point=point, **kwargs)
+            _infer_batch_window(self._store, kwargs)
             return self._da.sel(**kwargs)
 
     @_xr.register_dataset_accessor("polytope")
@@ -547,9 +882,25 @@ try:
             self._ds = ds
             self._store = ds.attrs.get("_polytope_store")
 
-        def sel(self, var=None, **kwargs):
-            """Like ``.sel()``, but auto-sets batch_years from the time slice."""
-            _infer_batch_years(self._store, kwargs)
+        def sel(self, var=None, *, bbox=None, polygon=None, point=None,
+                **kwargs):
+            """Select data, with optional server-side spatial subsetting.
+
+            When *bbox*, *polygon*, or *point* is given the request is
+            executed as a Polytope **feature** (``clte`` stream, lat/lon
+            grid).  Otherwise delegates to the normal ``.sel()`` with
+            automatic batch tuning.
+            """
+            if bbox is not None or polygon is not None or point is not None:
+                if self._store and getattr(self._store, '_frequency', 'monthly') == 'monthly':
+                    raise ValueError(
+                        "Spatial features (bbox, polygon, point) require "
+                        "frequency='hourly' (clte stream)")
+                name = var or next(iter(self._ds.data_vars))
+                return _feature_sel(
+                    self._store, name,
+                    bbox=bbox, polygon=polygon, point=point, **kwargs)
+            _infer_batch_window(self._store, kwargs)
             result = self._ds.sel(**kwargs)
             return result[var] if var is not None else result
 

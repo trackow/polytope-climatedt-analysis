@@ -5,24 +5,26 @@ Metadata (variables, coordinates, dimensions, attributes) is available **instant
 
 The module also registers an xarray **`.polytope.sel()`** accessor that automatically batches multi-year requests into a single Polytope call.
 
-This document walks through the full implementation (~560 lines).
+This document walks through the full implementation (~700 lines).
 
 ---
 
 ## Table of contents
 
 1. [The core idea](#the-core-idea)
-2. [Construction](#construction)
-3. [Two internal dicts](#two-internal-dicts)
-4. [Metadata synthesis](#metadata-synthesis)
-5. [Lazy chunk fetching & batching](#lazy-chunk-fetching--batching)
-6. [Batch splitting](#batch-splitting-_split_batch)
-7. [MutableMapping interface](#mutablemapping-interface)
-8. [Convenience methods](#convenience-methods)
-9. [The `.polytope.sel()` accessor](#the-polytopesel-accessor)
-10. [Caching architecture](#caching-architecture)
-11. [Data flow summary](#data-flow-summary)
-12. [Why the zarr protocol limits us](#why-the-zarr-protocol-limits-us)
+2. [Factory classmethod](#factory-classmethod)
+3. [Construction (low-level)](#construction)
+4. [Two internal dicts](#two-internal-dicts)
+5. [Metadata synthesis](#metadata-synthesis)
+6. [Lazy chunk fetching & batching](#lazy-chunk-fetching--batching)
+7. [Batch splitting](#batch-splitting-_split_batch)
+8. [MutableMapping interface](#mutablemapping-interface)
+9. [Convenience methods](#convenience-methods)
+10. [The `.polytope.sel()` accessor](#the-polytopesel-accessor)
+11. [Server-side spatial features](#server-side-spatial-features)
+12. [Caching architecture](#caching-architecture)
+13. [Data flow summary](#data-flow-summary)
+14. [Why the zarr protocol limits us](#why-the-zarr-protocol-limits-us)
 
 ---
 
@@ -39,6 +41,70 @@ Zarr stores are just key → value mappings.  A zarr v2 store needs to serve:
 | `<array>/0` or `<array>/0.1.2` | Raw bytes for a data chunk |
 
 `PolytopeZarrStore` implements Python's `MutableMapping` interface (`__getitem__`, `__contains__`, etc.), so zarr and xarray can treat it as a store.  The trick: **coordinate chunks are pre-computed in memory, but data variable chunks trigger a Polytope request on first access.**
+
+---
+
+## Factory classmethod
+
+The recommended way to create a store for Climate DT data:
+
+```python
+store = PolytopeZarrStore.from_climate_dt(
+    models=["ICON", "IFS-FESOM", "IFS-NEMO"],
+    experiment="hist",
+    levtype="sfc",
+    years=range(1990, 2015),   # required for monthly
+)
+```
+
+Or for hourly instantaneous data (clte stream):
+
+```python
+store = PolytopeZarrStore.from_climate_dt(
+    models=["ICON"],
+    experiment="hist",
+    levtype="sfc",
+    frequency="hourly",
+    start_date="2020-01-01",
+    end_date="2020-01-02",
+)
+```
+
+### Factory parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `models` | `list[str]` | — | Model names (e.g. `["ICON", "IFS-FESOM", "IFS-NEMO"]`) |
+| `experiment` | `str` | — | `"hist"`, `"cont"`, or `"SSP3-7.0"` |
+| `levtype` | `str` | — | `"sfc"`, `"pl"`, `"hl"`, `"sol"`, `"o2d"`, or `"o3d"` |
+| `frequency` | `str` | `"monthly"` | `"monthly"` (clmn stream) or `"hourly"` (clte stream) |
+| `years` | range/list | — | Years to include (required for monthly) |
+| `start_date` | `str` | — | ISO date (required for hourly) |
+| `end_date` | `str` | — | ISO date (required for hourly) |
+| `resolution` | `str` | `"standard"` | `"standard"` (nside 128) or `"high"` (nside 1024) |
+| `realization` | `int` | `1` | Realization number |
+
+### What the factory auto-derives
+
+- **address** — IFS-NEMO → MN5; all others → LUMI
+- **activity** — `"baseline"` if experiment ∈ {hist, cont}, else `"projections"`
+- **n_cells** — `12 × 128²` (standard) or `12 × 1024²` (high)
+- **stream** — `"clmn"` for monthly, `"clte"` for hourly
+- **time_fields** — `["year", "month"]` for monthly, `["date", "time"]` for hourly
+- **batch_size** — 12 for monthly, 24 for hourly
+- **time axis** — `pd.date_range(freq="MS")` from years, or `freq="h"` from dates
+- **coords, variables** — looked up from `PORTFOLIO_GEN2_CLMN[levtype]`
+- **base_request** — all fixed Polytope fields (class, dataset, generation=2, etc.)
+
+### Frequency-aware internals
+
+The `_frequency` attribute (`"monthly"` or `"hourly"`) controls three internal methods:
+
+1. **`_time_to_fields(ts)`** — converts a timestamp to Polytope request fields
+2. **`_fetch_chunk`** batch grouping — groups by year-range (monthly) or day-range (hourly)
+3. **`_split_batch`** field matching — matches by `(year, month)` or `(date, time)` metadata
+
+Spatial features (`bbox`, `polygon`, `point`) are only available on hourly stores (clte stream).
 
 ---
 
@@ -321,6 +387,70 @@ _PolytopeDataArray.__init__(da)
 _PolytopeDataArray.sel(**kwargs)
   → _infer_batch_years(self._store, kwargs)     # sets store.batch_years
   → return self._da.sel(**kwargs)                # normal xarray .sel()
+```
+
+---
+
+## Server-side spatial features
+
+`.polytope.sel()` also accepts **spatial keyword arguments** that bypass the zarr store entirely and execute a [Polytope feature request](https://polytope-examples.readthedocs.io/).  The result is an xarray Dataset on a **lat/lon grid** (not HEALPix).
+
+### Important: stream differences
+
+Feature requests use the **`clte` stream** (instantaneous forecast fields).  This is different from the zarr store's `clmn` stream (monthly means).  The Polytope server only supports features on `clte` — a `clmn` feature request is rejected with *"got stream : clmn, but expected one of ['clte']"*.
+
+The accessor auto-switches `stream` from `clmn` → `clte`, removes `year`/`month` fields, and converts the `time` argument to `date` format (`YYYYMMDD`).
+
+### Bounding box
+
+```python
+ds["avg_2t"].polytope.sel(
+    model="IFS-FESOM",
+    time="2010-06",
+    bbox=(47, 5, 55, 15),   # (south, west, north, east) in degrees
+)
+```
+
+Returns all grid points within the box for a single date.  Coordinates in the result are named `latitude` and `longitude`.
+
+### Polygon
+
+```python
+ds["avg_2t"].polytope.sel(
+    model="IFS-FESOM",
+    time="2010-06",
+    polygon=[(41.87, -8.88), (41.69, -8.82), ...],  # (lat, lon) vertices
+)
+```
+
+Same as bounding box but returns only points inside the polygon boundary.
+
+### Point timeseries
+
+```python
+ds["avg_2t"].polytope.sel(
+    model="IFS-FESOM",
+    time=slice("2010-01", "2010-12"),
+    point=(52.5, 13.4),    # (lat, lon) — Berlin
+)
+```
+
+Returns a timeseries at a single location over the requested date range.  The `time_axis` is set to `"date"` so the output has a time dimension.
+
+### How it works internally
+
+```
+.polytope.sel(bbox=..., time="2010-06", model="IFS-FESOM")
+  │
+  ├─ copy store._base_request
+  ├─ stream: clmn → clte
+  ├─ remove year/month, add date: "20100601"
+  ├─ add time: "0000"
+  ├─ add feature: {type: "boundingbox", points: [...]}
+  ├─ param: "avg_2t" (from DataArray name)
+  │
+  └─ earthkit.data.from_source("polytope", ...) → .to_xarray()
+       → xarray Dataset with latitude/longitude coordinates
 ```
 
 ---
