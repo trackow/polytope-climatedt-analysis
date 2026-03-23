@@ -71,6 +71,25 @@ Open **`03_lazy_browse_portfolio.ipynb`**. This notebook:
 
 The variable catalogue is defined in `destine_portfolio.py` (65 variables across all levtypes).
 
+### CLTE (hourly) stream — variable summary
+
+The hourly (`clte`) stream provides 64 variables across 6 levtypes.
+Atmosphere fields (sfc, pl, hl, sol) are hourly; ocean/ice (o2d, o3d) are daily means.
+
+| levtype | # vars | time res | description |
+|---------|--------|----------|-------------|
+| sfc (instant) | 14 | hourly | Standard shortNames (no `avg_` prefix): `tclw`, `tciw`, `sp`, `tcw`, `tcwv`, `sd`, `msl`, `tcc`, `10u`, `10v`, `2t`, `2d`, `10si`, `skt` |
+| sfc (hourly mean) | 20 | hourly | Fluxes / radiation — keep `avg_` prefix: `avg_surfror` … `avg_tprate` |
+| pl | 9 | hourly | 19 pressure levels (1000–1 hPa): `pv`, `z`, `t`, `u`, `v`, `q`, `w`, `r`, `clwc` |
+| hl | 2 | hourly | 100 m only, IFS-only: `u`, `v` |
+| sol | 2 | hourly | Snow (1–5) + soil (1–4/5): `sd`, `vsw` |
+| o2d | 12 | daily | Sea ice (6) + ocean surface (6), `avg_` prefix |
+| o3d | 5 | daily | 3-D ocean (up to 75 levels), `avg_` prefix |
+
+> **Key difference from clmn:** SFC instantaneous, PL, HL, and SOL params use standard ECMWF shortNames
+> (e.g. `2t` instead of `avg_2t`). Also `10si` instead of `10ws` for 10 m wind speed.
+> Ocean/ice fields remain `avg_`-prefixed (daily means).
+
 > **Note:** For multi-level levtypes (`pl`, `hl`, `sol`, `o3d`) you need to select a specific level when plotting, e.g.
 > ```python
 > ds["avg_t"].sel(model="ICON", time="2014-06-01", level=850)
@@ -83,9 +102,10 @@ The variable catalogue is defined in `destine_portfolio.py` (65 variables across
 |------|-------------|
 | `01_key_destine_once.ipynb` | One-time authentication — stores your API key in order to access Climate DT data |
 | `02_climate_change_destine.ipynb` | Climate change analysis notebook (batch download, 30-year means) |
-| `03_lazy_browse_portfolio.ipynb` | Lazy browsing of the full Climate DT portfolio (instant xarray Dataset) |
+| `03_lazy_browse_portfolio.ipynb` | Lazy browsing of the full Climate DT monthly (clmn) portfolio |
+| `04_lazy_browse_portfolio_hourly.ipynb` | Lazy browsing of the hourly (clte) portfolio |
 | `destine_climate_helpers.py` | Helper module (polytope request handling, caching, data retrieval, chunking over years) |
-| `destine_portfolio.py` | Data portfolio — 65 variables across 6 levtypes (`sfc`, `pl`, `hl`, `sol`, `o2d`, `o3d`) |
+| `destine_portfolio.py` | Data portfolio — clmn (65 vars) and clte (64 vars) across 6 levtypes |
 | `polytope_zarr.py` | Virtual zarr store backed by Polytope (lazy chunk fetching) |
 | `requirements.txt` | Python dependencies with version pins (zarr v2, numcodecs) |
 
