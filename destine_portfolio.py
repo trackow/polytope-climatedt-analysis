@@ -20,6 +20,10 @@ D_SFC = ("model", "time", "cell")
 D_LEV = ("model", "time", "level", "cell")
 D_O2D = ("model", "time", "cell")
 
+# Storyline dims: outer dimension is "climate" (experiment) instead of "model"
+D_STORY_SFC = ("climate", "time", "cell")
+D_STORY_LEV = ("climate", "time", "level", "cell")
+
 # ── Surface (sfc) ──────────────────────────────────────────────────
 SFC_VARIABLES = {
     # Single-level / surface atmosphere (instant params in clte)
@@ -304,5 +308,64 @@ PORTFOLIO_GEN2_CLTE = {
         "freq": "D",
         "levels": list(range(1, 76)),
         "variables": CLTE_O3D_VARIABLES,
+    },
+}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STORYLINE portfolio — CLTE variables with "climate" dimension
+# ════════════════════════════════════════════════════════════════════
+# Storyline simulations (activity "story-nudging") are IFS-FESOM only.
+# The outer dimension is "climate" (experiment names like cont/hist/Tplus2.0K)
+# instead of "model".
+
+def _story_vars(clte_vars, dim_sfc, dim_lev):
+    """Re-dim clte variables: replace model→climate in dim tuples."""
+    out = {}
+    for name, spec in clte_vars.items():
+        new_spec = dict(spec)
+        if spec["dims"] in (D_SFC, D_O2D):
+            new_spec["dims"] = dim_sfc
+        elif spec["dims"] == D_LEV:
+            new_spec["dims"] = dim_lev
+        out[name] = new_spec
+    return out
+
+PORTFOLIO_GEN2_STORYLINE = {
+    "sfc": {
+        "levtype": "sfc",
+        "freq": "h",
+        "levels": None,
+        "variables": _story_vars(CLTE_SFC_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+    },
+    "pl": {
+        "levtype": "pl",
+        "freq": "h",
+        "levels": [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 70, 50, 30, 20, 10, 5, 1],
+        "variables": _story_vars(CLTE_PL_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+    },
+    "hl": {
+        "levtype": "hl",
+        "freq": "h",
+        "levels": [100],
+        "variables": _story_vars(CLTE_HL_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+    },
+    "sol": {
+        "levtype": "sol",
+        "freq": "h",
+        "levels": [1, 2, 3, 4, 5],
+        "variables": _story_vars(CLTE_SOL_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+    },
+    "o2d": {
+        "levtype": "o2d",
+        "freq": "D",
+        "levels": None,
+        "variables": _story_vars(CLTE_O2D_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+    },
+    "o3d": {
+        "levtype": "o3d",
+        "freq": "D",
+        "levels": list(range(1, 76)),
+        "variables": _story_vars(CLTE_O3D_VARIABLES, D_STORY_SFC, D_STORY_LEV),
     },
 }
