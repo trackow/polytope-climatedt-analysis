@@ -67,35 +67,111 @@ class PolytopeZarrStore(MutableMapping):
                         years=None,
                         start_date=None, end_date=None,
                         resolution="standard",
-                        realization=1):
+                        realization=1,
+                        activity=None):
         """Create a store for DestinE Climate DT Generation 2 data.
 
         Parameters
         ----------
         models : list of str
             Model names, e.g. ["ICON", "IFS-FESOM", "IFS-NEMO"].
-        experiment : str
-            "hist", "cont", or "SSP3-7.0".
+        experiment : str or list of str
+            Single experiment ("hist", "cont", "SSP3-7.0", "Tplus2.0K"),
+            or a list of experiments for storyline simulations.
+            When *activity* = "story-nudging", pass a list like
+            ["cont", "hist", "Tplus2.0K"] — these become the "climate"
+            dimension in the resulting dataset.
         levtype : str
             "sfc", "pl", "hl", "sol", "o2d", or "o3d".
         frequency : str, optional
             "monthly" (clmn stream, default) or "hourly" (clte stream).
+            Ignored when *activity* = "story-nudging" (always clte/hourly).
         years : range or list, optional
             Years to include.  Required when *frequency* = "monthly".
         start_date, end_date : str, optional
             ISO date strings (e.g. "2020-01-01").  Required when
-            *frequency* = "hourly".
+            *frequency* = "hourly" or *activity* = "story-nudging".
         resolution : str, optional
-            "standard" (nside 128) or "high" (nside 1024).  Default "standard".
+            "standard" (nside 128) or "high".  Default "standard".
+            High resolution is nside 1024 (4.4 km) for baseline/projections,
+            nside 512 (9 km) for storylines.
         realization : int, optional
             Realization number.  Default 1.
+        activity : str, optional
+            "baseline", "projections", or "story-nudging".
+            Default None = auto-detect ("hist"/"cont" → "baseline",
+            else "projections").  Must be set explicitly for storyline
+            simulations ("story-nudging"); storylines are IFS-FESOM only.
 
         Returns
         -------
         PolytopeZarrStore
         """
-        from destine_portfolio import PORTFOLIO_GEN2_CLMN, PORTFOLIO_GEN2_CLTE
+        from destine_portfolio import (PORTFOLIO_GEN2_CLMN, PORTFOLIO_GEN2_CLTE,
+                                       PORTFOLIO_GEN2_STORYLINE)
 
+        # ── Storyline path ──────────────────────────────────────────
+        if activity == "story-nudging":
+            if start_date is None or end_date is None:
+                raise ValueError(
+                    "start_date and end_date are required for storyline simulations")
+            experiments = experiment if isinstance(experiment, list) else [experiment]
+            stream = "clte"
+            portfolio = PORTFOLIO_GEN2_STORYLINE
+            address = "polytope.mn5.apps.dte.destination-earth.eu"
+
+            # Storylines ran at 9 km (nside 512), not 4.4 km (nside 1024)
+            nside = 128 if resolution == "standard" else 512
+            n_cells = 12 * nside ** 2
+            lt = portfolio[levtype]
+            freq = lt["freq"]
+
+            if freq == "h":
+                time_axis = pd.date_range(start_date, end_date, freq="h")
+                time_fields = ["date", "time"]
+                batch_size = 24
+            elif freq == "D":
+                time_axis = pd.date_range(start_date, end_date, freq="D")
+                time_fields = ["date", "time"]
+                batch_size = 1
+            else:
+                raise ValueError(f"Unknown portfolio freq {freq!r}")
+
+            coords = {"time": time_axis, "cell": range(n_cells),
+                      "climate": experiments}
+            if lt["levels"] is not None:
+                coords["level"] = lt["levels"]
+
+            base_request = {
+                "class": "d1",
+                "dataset": "climate-dt",
+                "type": "fc",
+                "expver": "0001",
+                "generation": "2",
+                "realization": str(realization),
+                "activity": "story-nudging",
+                "model": "IFS-FESOM",
+                "levtype": lt["levtype"],
+                "resolution": resolution,
+                "stream": stream,
+            }
+
+            store = cls(
+                address=address,
+                collection="destination-earth",
+                base_request=base_request,
+                coords=coords,
+                variables=lt["variables"],
+                internal_dims=["cell"],
+                time_fields=time_fields,
+                batch_size=batch_size,
+            )
+            store._frequency = "hourly"
+            store._freq = freq
+            store._resolution = resolution
+            return store
+
+        # ── Standard path (baseline / projections) ──────────────────
         # Validate frequency / time args
         if frequency == "monthly":
             if years is None:
@@ -114,7 +190,8 @@ class PolytopeZarrStore(MutableMapping):
         # Derived parameters
         nside = 128 if resolution == "standard" else 1024
         n_cells = 12 * nside ** 2
-        activity = "baseline" if experiment in ("hist", "cont") else "projections"
+        if activity is None:
+            activity = "baseline" if experiment in ("hist", "cont") else "projections"
         address = {m: ("polytope.mn5.apps.dte.destination-earth.eu"
                        if m == "IFS-NEMO" else
                        "polytope.lumi.apps.dte.destination-earth.eu")
@@ -462,6 +539,8 @@ class PolytopeZarrStore(MutableMapping):
                     request[f] = fm[f]
             elif dim == "model":
                 request["model"] = str(self._coords["model"][idx])
+            elif dim == "climate":
+                request["experiment"] = str(self._coords["climate"][idx])
             elif dim == "level":
                 request["levelist"] = str(int(self._coords["level"][idx]))
             else:
@@ -554,6 +633,7 @@ class PolytopeZarrStore(MutableMapping):
                 try:
                     vals = tuple(
                         int(field.metadata(k)) if k in ("year", "month")
+                        else str(field.metadata(k)).zfill(4) if k == "time"
                         else str(field.metadata(k))
                         for k in meta_keys)
                 except Exception:
