@@ -68,7 +68,8 @@ class PolytopeZarrStore(MutableMapping):
                         start_date=None, end_date=None,
                         resolution="standard",
                         realization=1,
-                        activity=None):
+                        activity=None,
+                        address=None):
         """Create a store for DestinE Climate DT Generation 2 data.
 
         Parameters
@@ -102,6 +103,11 @@ class PolytopeZarrStore(MutableMapping):
             Default None = auto-detect ("hist"/"cont" → "baseline",
             else "projections").  Must be set explicitly for storyline
             simulations ("story-nudging"); storylines are IFS-FESOM only.
+        address : str, optional
+            Override the Polytope server URL.  When set, all models use
+            this address (e.g. for test servers like
+            ``"polytope-test.mn5.apps.dte.destination-earth.eu"``).
+            Default None = auto-detect per model.
 
         Returns
         -------
@@ -118,7 +124,7 @@ class PolytopeZarrStore(MutableMapping):
             experiments = experiment if isinstance(experiment, list) else [experiment]
             stream = "clte"
             portfolio = PORTFOLIO_GEN2_STORYLINE
-            address = "polytope.mn5.apps.dte.destination-earth.eu"
+            _address = address or "polytope.mn5.apps.dte.destination-earth.eu"
 
             # Storylines ran at 9 km (nside 512), not 4.4 km (nside 1024)
             nside = 128 if resolution == "standard" else 512
@@ -157,7 +163,7 @@ class PolytopeZarrStore(MutableMapping):
             }
 
             store = cls(
-                address=address,
+                address=_address,
                 collection="destination-earth",
                 base_request=base_request,
                 coords=coords,
@@ -169,6 +175,7 @@ class PolytopeZarrStore(MutableMapping):
             store._frequency = "hourly"
             store._freq = freq
             store._resolution = resolution
+            store.nside = nside
             return store
 
         # ── Standard path (baseline / projections) ──────────────────
@@ -192,10 +199,13 @@ class PolytopeZarrStore(MutableMapping):
         n_cells = 12 * nside ** 2
         if activity is None:
             activity = "baseline" if experiment in ("hist", "cont") else "projections"
-        address = {m: ("polytope.mn5.apps.dte.destination-earth.eu"
-                       if m == "IFS-NEMO" else
-                       "polytope.lumi.apps.dte.destination-earth.eu")
-                   for m in models}
+        if address is not None:
+            _address = address
+        else:
+            _address = {m: ("polytope.mn5.apps.dte.destination-earth.eu"
+                            if m == "IFS-NEMO" else
+                            "polytope.lumi.apps.dte.destination-earth.eu")
+                        for m in models}
 
         # Portfolio lookup
         lt = portfolio[levtype]
@@ -238,7 +248,7 @@ class PolytopeZarrStore(MutableMapping):
         }
 
         store = cls(
-            address=address,
+            address=_address,
             collection="destination-earth",
             base_request=base_request,
             coords=coords,
@@ -250,6 +260,7 @@ class PolytopeZarrStore(MutableMapping):
         store._frequency = frequency
         store._freq = freq  # "MS", "h", or "D" — from portfolio
         store._resolution = resolution
+        store.nside = nside
         return store
 
     # ── Constructor ──────────────────────────────────────────────────
@@ -824,9 +835,9 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
                  **sel_kwargs):
     """Execute a server-side Polytope feature request.
 
-    Feature requests use the ``clte`` stream (instantaneous forecast fields)
-    and return data on a lat/lon grid — **not** the HEALPix grid used by the
-    zarr store's ``clmn`` monthly-mean data.
+    Feature requests return data on a lat/lon grid or as point timeseries.
+    For **hourly** stores (``clte`` stream), data is returned as GRIB.
+    For **monthly** stores (``clmn`` stream), timeseries are returned as JSON.
 
     Parameters
     ----------
@@ -834,14 +845,13 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
     var_name : str
         Variable / param name (e.g. ``"avg_2t"``).
     bbox : (south, west, north, east)
-        Bounding-box corners in degrees.  Supports single dates and date
-        ranges (``time=slice(...)``).  Returns a ``points`` dimension with
+        Bounding-box corners in degrees.  Returns a ``points`` dimension with
         ``latitude``/``longitude`` coordinates.
     polygon : list of (lat, lon)
         Polygon vertices.  Same date handling as *bbox*.
     point : (lat, lon)
         Single location for a timeseries extraction.  Supports date ranges
-        via ``time=slice(...)``.  Returns a ``t`` time dimension.
+        via ``time=slice(...)``.
     **sel_kwargs
         ``model``, ``time``, ``level`` — forwarded into the Polytope request.
     """
@@ -852,10 +862,7 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
             "No PolytopeZarrStore attached — open the dataset via store.open().")
 
     request = dict(store._base_request)
-    # Features require the clte stream
-    if request.get("stream") != "clte":
-        request["stream"] = "clte"
-    # Remove time-specific fields; replaced by date below
+    # Remove time-specific fields; replaced below
     for f in store._time_fields:
         request.pop(f, None)
 
@@ -863,52 +870,76 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
 
     if "model" in sel_kwargs:
         request["model"] = str(sel_kwargs["model"])
+    if "climate" in sel_kwargs:
+        request["experiment"] = str(sel_kwargs["climate"])
     if "level" in sel_kwargs:
         request["levelist"] = str(int(sel_kwargs["level"]))
 
-    # ── time → date + time conversion ─────────────────────────────────
-    # For date ranges, MARS forms the Cartesian product of date × time,
-    # so we list all 24 hours.  For a single timestamp, just that hour.
-    _ALL_HOURS = "/".join(f"{h:02d}00" for h in range(24))
+    freq = getattr(store, "_freq", "MS")
+    is_monthly = freq == "MS"
 
+    # ── time handling ─────────────────────────────────────────────────
     time_arg = sel_kwargs.get("time")
-    if isinstance(time_arg, slice):
-        t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
-        t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
-        date_str = f"{t0.strftime('%Y%m%d')}/to/{t1.strftime('%Y%m%d')}"
-        time_str = _ALL_HOURS
-    elif time_arg is not None:
-        ts = pd.Timestamp(time_arg)
-        date_str = ts.strftime("%Y%m%d")
-        time_str = ts.strftime("%H%M")
+
+    if is_monthly:
+        # Monthly (clmn) — use year/month fields
+        if isinstance(time_arg, slice):
+            t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
+            t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
+            months = pd.date_range(t0, t1, freq="MS")
+            years = sorted({str(m.year) for m in months})
+            mons = sorted({str(m.month) for m in months})
+            request["year"] = "/to/".join([years[0], years[-1]]) if len(years) > 1 else years[0]
+            request["month"] = "/to/".join([mons[0], mons[-1]]) if len(mons) > 1 else mons[0]
+        elif time_arg is not None:
+            ts = pd.Timestamp(time_arg)
+            request["year"] = str(ts.year)
+            request["month"] = str(ts.month)
+        else:
+            ts = pd.Timestamp(store._coords["time"][0])
+            request["year"] = str(ts.year)
+            request["month"] = str(ts.month)
     else:
-        ts = pd.Timestamp(store._coords["time"][0])
-        date_str = ts.strftime("%Y%m%d")
-        time_str = ts.strftime("%H%M")
-    request["date"] = date_str
+        # Hourly / daily (clte) — use date/time fields
+        _ALL_HOURS = "/".join(f"{h:02d}00" for h in range(24))
+        if isinstance(time_arg, slice):
+            t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
+            t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
+            date_str = f"{t0.strftime('%Y%m%d')}/to/{t1.strftime('%Y%m%d')}"
+            time_str = _ALL_HOURS if freq == "h" else "0000"
+        elif time_arg is not None:
+            ts = pd.Timestamp(time_arg)
+            date_str = ts.strftime("%Y%m%d")
+            time_str = ts.strftime("%H%M")
+        else:
+            ts = pd.Timestamp(store._coords["time"][0])
+            date_str = ts.strftime("%Y%m%d")
+            time_str = ts.strftime("%H%M")
+        request["date"] = date_str
+        request["time"] = time_str
 
     # ── feature dict ────────────────────────────────────────────────
     if bbox is not None:
         south, west, north, east = bbox
-        request["time"] = time_str
         request["feature"] = {
             "type": "boundingbox",
             "points": [[north, west], [south, east]],
         }
     elif polygon is not None:
-        request["time"] = time_str
         request["feature"] = {
             "type": "polygon",
             "shape": [list(pt) for pt in polygon],
         }
     elif point is not None:
         lat, lon = point
-        request["time"] = time_str
-        request["feature"] = {
+        feature = {
             "type": "timeseries",
             "points": [[lat, lon]],
-            "time_axis": "date",
+            "axes": ["latitude", "longitude"],
         }
+        # time_axis depends on the stream
+        feature["time_axis"] = "month" if is_monthly else "date"
+        request["feature"] = feature
 
     # ── resolve address & fetch ─────────────────────────────────────
     address = store._address
@@ -917,15 +948,172 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
         address = address.get(m, list(address.values())[0])
 
     ftype = request["feature"]["type"]
+    time_info = request.get("date", f"{request.get('year')}-{request.get('month')}")
     logging.getLogger(__name__).info(
-        "%s request for %s (%s)", ftype, var_name, date_str)
-    print(f"  🌍 {ftype} request for {var_name} ({date_str})")
+        "%s request for %s (%s)", ftype, var_name, time_info)
+    print(f"  🌍 {ftype} request for {var_name} ({time_info})")
 
     with _quiet_polytope_loggers():
         data = earthkit.data.from_source(
             "polytope", store._collection, request,
             address=address, stream=False)
+
+    # Timeseries (point) requests return JSON; bbox/polygon return GRIB.
+    # Try _json() first for timeseries, fall back to to_xarray().
+    if point is not None:
+        try:
+            return data._json()
+        except Exception:
+            pass
     return data.to_xarray()
+
+
+def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
+    """Server-side spatial subsetting via MARS *area* + *grid* keywords.
+
+    Unlike feature requests (bbox/polygon/point), this uses the same stream
+    as the store (``clmn`` or ``clte``) and always works with Generation 2
+    data on both ``lumi`` and ``mn5``.
+
+    Parameters
+    ----------
+    store : PolytopeZarrStore
+    var_name : str
+        Variable / param name (e.g. ``"avg_2t"``).
+    area : (north, west, south, east)
+        Bounding box in MARS order (degrees).
+    grid : str or (float, float), optional
+        Output grid spacing.  Default ``"0.25/0.25"`` for standard
+        resolution,  ``"0.05/0.05"`` for high resolution.
+    **sel_kwargs
+        ``model`` or ``climate``, ``time``, ``level`` — forwarded into
+        the Polytope request.
+    """
+    import earthkit.data
+
+    if store is None:
+        raise ValueError(
+            "No PolytopeZarrStore attached — open the dataset via store.open().")
+
+    request = dict(store._base_request)
+
+    # Remove time-specific fields; replaced by date below
+    for f in store._time_fields:
+        request.pop(f, None)
+
+    request["param"] = var_name
+
+    # ── model / climate ───────────────────────────────────────────────
+    if "model" in sel_kwargs:
+        request["model"] = str(sel_kwargs["model"])
+    if "climate" in sel_kwargs:
+        request["experiment"] = str(sel_kwargs["climate"])
+    if "level" in sel_kwargs:
+        request["levelist"] = str(int(sel_kwargs["level"]))
+
+    # ── area + grid ───────────────────────────────────────────────────
+    n, w, s, e = area
+    request["area"] = f"{n}/{w}/{s}/{e}"
+
+    if grid is None:
+        res = getattr(store, "_resolution", "standard")
+        grid = "0.05/0.05" if res == "high" else "0.25/0.25"
+    elif isinstance(grid, (list, tuple)):
+        grid = f"{grid[0]}/{grid[1]}"
+    request["grid"] = str(grid)
+
+    # ── time handling ─────────────────────────────────────────────────
+    _ALL_HOURS = "/".join(f"{h:02d}00" for h in range(24))
+    freq = getattr(store, "_freq", "MS")
+
+    time_arg = sel_kwargs.get("time")
+    if freq == "MS":
+        # Monthly store: keep year/month fields (clmn stream uses these).
+        # Multi-month slices must be fetched per-month and concatenated
+        # because each month has a different step_timedelta (28-31 days),
+        # which prevents earthkit from forming a valid hypercube.
+        if isinstance(time_arg, slice):
+            t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
+            t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
+            months = pd.date_range(t0, t1, freq="MS")
+            pieces = []
+            for mon in months:
+                req_i = dict(request)
+                req_i["year"] = str(mon.year)
+                req_i["month"] = str(mon.month)
+                pieces.append((mon, req_i))
+            _multi_month = pieces  # handled in fetch section below
+        elif time_arg is not None:
+            ts = pd.Timestamp(time_arg)
+            request["year"] = str(ts.year)
+            request["month"] = str(ts.month)
+            _multi_month = None
+        else:
+            ts = pd.Timestamp(store._coords["time"][0])
+            request["year"] = str(ts.year)
+            request["month"] = str(ts.month)
+            _multi_month = None
+    else:
+        _multi_month = None
+        # Hourly / daily store
+        if isinstance(time_arg, slice):
+            t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
+            t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
+            date_str = f"{t0.strftime('%Y%m%d')}/to/{t1.strftime('%Y%m%d')}"
+            time_str = _ALL_HOURS if freq == "h" else "0000"
+        elif time_arg is not None:
+            ts = pd.Timestamp(time_arg)
+            date_str = ts.strftime("%Y%m%d")
+            time_str = ts.strftime("%H%M")
+        else:
+            ts = pd.Timestamp(store._coords["time"][0])
+            date_str = ts.strftime("%Y%m%d")
+            time_str = ts.strftime("%H%M")
+        request["date"] = date_str
+        request["time"] = time_str
+
+    # ── resolve address & fetch ─────────────────────────────────────
+    address = store._address
+    if isinstance(address, dict):
+        m = request.get("model", "")
+        address = address.get(m, list(address.values())[0])
+
+    # Rename GRIB-native dims to friendly names (idempotent if already correct)
+    _dim_renames = {
+        "forecast_reference_time": "time",
+        "valid_time": "time",
+    }
+
+    def _rename_dims(ds):
+        renames = {k: v for k, v in _dim_renames.items() if k in ds.dims}
+        return ds.rename(renames) if renames else ds
+
+    if _multi_month is not None:
+        # Fetch each month individually to avoid step_timedelta mismatch
+        import xarray as xr
+        datasets = []
+        for mon, req_i in _multi_month:
+            time_info = f"{req_i['year']}-{req_i['month']}"
+            print(f"  🌍 area request for {var_name} "
+                  f"({time_info}, area={req_i['area']}, grid={req_i['grid']})")
+            with _quiet_polytope_loggers():
+                data = earthkit.data.from_source(
+                    "polytope", store._collection, req_i,
+                    address=address, stream=False)
+            datasets.append(_rename_dims(data.to_xarray()))
+        return xr.concat(datasets, dim="time")
+
+    logging.getLogger(__name__).info(
+        "area request for %s (grid=%s)", var_name, request["grid"])
+    time_info = request.get("date", f"{request.get('year')}-{request.get('month')}")
+    print(f"  🌍 area request for {var_name} "
+          f"({time_info}, area={request['area']}, grid={request['grid']})")
+
+    with _quiet_polytope_loggers():
+        data = earthkit.data.from_source(
+            "polytope", store._collection, request,
+            address=address, stream=False)
+    return _rename_dims(data.to_xarray())
 
 
 try:
@@ -937,19 +1125,24 @@ try:
             self._da = da
             self._store = da.attrs.get("_polytope_store")
 
-        def sel(self, *, bbox=None, polygon=None, point=None, **kwargs):
+        def sel(self, *, bbox=None, polygon=None, point=None,
+                area=None, grid=None, **kwargs):
             """Select data, with optional server-side spatial subsetting.
+
+            When *area* is given the request adds MARS ``area`` + ``grid``
+            keywords for server-side regridding (works for both ``clmn``
+            and ``clte`` streams).
 
             When *bbox*, *polygon*, or *point* is given the request is
             executed as a Polytope **feature** (``clte`` stream, lat/lon
             grid).  Otherwise delegates to the normal ``.sel()`` with
             automatic batch tuning.
             """
+            if area is not None:
+                return _area_sel(
+                    self._store, self._da.name,
+                    area=area, grid=grid, **kwargs)
             if bbox is not None or polygon is not None or point is not None:
-                if self._store and getattr(self._store, '_frequency', 'monthly') == 'monthly':
-                    raise ValueError(
-                        "Spatial features (bbox, polygon, point) require "
-                        "frequency='hourly' (clte stream)")
                 return _feature_sel(
                     self._store, self._da.name,
                     bbox=bbox, polygon=polygon, point=point, **kwargs)
@@ -963,19 +1156,24 @@ try:
             self._store = ds.attrs.get("_polytope_store")
 
         def sel(self, var=None, *, bbox=None, polygon=None, point=None,
-                **kwargs):
+                area=None, grid=None, **kwargs):
             """Select data, with optional server-side spatial subsetting.
+
+            When *area* is given the request adds MARS ``area`` + ``grid``
+            keywords for server-side regridding (works for both ``clmn``
+            and ``clte`` streams).
 
             When *bbox*, *polygon*, or *point* is given the request is
             executed as a Polytope **feature** (``clte`` stream, lat/lon
             grid).  Otherwise delegates to the normal ``.sel()`` with
             automatic batch tuning.
             """
+            if area is not None:
+                name = var or next(iter(self._ds.data_vars))
+                return _area_sel(
+                    self._store, name,
+                    area=area, grid=grid, **kwargs)
             if bbox is not None or polygon is not None or point is not None:
-                if self._store and getattr(self._store, '_frequency', 'monthly') == 'monthly':
-                    raise ValueError(
-                        "Spatial features (bbox, polygon, point) require "
-                        "frequency='hourly' (clte stream)")
                 name = var or next(iter(self._ds.data_vars))
                 return _feature_sel(
                     self._store, name,
