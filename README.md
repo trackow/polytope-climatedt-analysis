@@ -71,6 +71,15 @@ Open **`03_lazy_browse_portfolio.ipynb`** (monthly) or **`04_lazy_browse_portfol
 
 The variable catalogue is defined in `destine_portfolio.py` (65 variables across all levtypes).
 
+### 6. Look up variables and get access snippets
+
+Open **`05_variable_lookup.ipynb`**. This notebook lets you:
+
+1. Search for variables by **shortName** (e.g. `"2t"`, `"avg_tos"`) or by **keyword** in the long name (e.g. `"temperature"`, `"wind"`)
+2. See which streams (monthly, hourly, storyline), levtypes, models, and experiments each variable is available in
+3. Generate a **ready-to-copy** `from_climate_dt()` code snippet with `access_snippet()`
+4. Browse the full catalogue of all ~190 variable × stream combinations
+
 ### CLTE (hourly) stream — variable summary
 
 The hourly (`clte`) stream provides 64 variables across 6 levtypes.
@@ -104,10 +113,11 @@ Atmosphere fields (sfc, pl, hl, sol) are hourly; ocean/ice (o2d, o3d) are daily 
 | `02_climate_change_destine.ipynb` | Climate change analysis notebook (batch download, 30-year means) |
 | `03_lazy_browse_portfolio.ipynb` | Lazy browsing of the full Climate DT monthly (clmn) portfolio |
 | `04_lazy_browse_portfolio_hourly.ipynb` | Lazy browsing of the hourly (clte) portfolio |
+| `05_variable_lookup.ipynb` | Variable discovery — search by name/keyword, generate `from_climate_dt()` snippets |
 | `TEST_03_monthly_test_server.ipynb` | Monthly (clmn) tests on `polytope-test.mn5` — lazy browse, area, timeseries, bbox, polygon |
 | `TEST_04_hourly_test_server.ipynb` | Hourly (clte) tests on `polytope-test.mn5` — lazy browse, area, timeseries, bbox, polygon |
 | `destine_climate_helpers.py` | Helper module (polytope request handling, caching, data retrieval, chunking over years) |
-| `destine_portfolio.py` | Data portfolio — clmn (65 vars) and clte (64 vars) across 6 levtypes |
+| `destine_portfolio.py` | Data portfolio — clmn (65 vars) and clte (64 vars) across 6 levtypes, plus `find_variable()` and `access_snippet()` lookup helpers |
 | `polytope_zarr.py` | Virtual zarr store backed by Polytope (lazy chunk fetching) |
 | `requirements.txt` | Python dependencies with version pins (zarr v2, numcodecs) |
 
