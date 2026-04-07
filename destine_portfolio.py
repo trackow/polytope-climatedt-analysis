@@ -354,7 +354,10 @@ PORTFOLIO_GEN2_STORYLINE = {
         "levtype": "sol",
         "freq": "h",
         "levels": [1, 2, 3, 4, 5],
-        "variables": _story_vars(CLTE_SOL_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+        "variables": {
+            **_story_vars(CLTE_SOL_VARIABLES, D_STORY_SFC, D_STORY_LEV),
+            "sot": {"dims": D_STORY_LEV, "long_name": "Soil temperature", "units": "K"},
+        },
     },
     "o2d": {
         "levtype": "o2d",
