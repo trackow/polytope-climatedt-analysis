@@ -79,6 +79,13 @@ Open **`05_variable_lookup.ipynb`**. This notebook lets you:
 2. See which streams (monthly, hourly, storyline), levtypes, models, and experiments each variable is available in
 3. Generate a **ready-to-copy** `from_climate_dt()` code snippet with `access_snippet()`
 4. Browse the full catalogue of all ~190 variable × stream combinations
+5. Inspect the **last Polytope request** sent by the store — useful for reuse with `earthkit.data` directly:
+   ```python
+   r = store.last_request
+   data = earthkit.data.from_source("polytope", r["collection"], r["request"],
+                                    address=r["address"], stream=False)
+   field = data.to_numpy()
+   ```
 
 ### CLTE (hourly) stream — variable summary
 

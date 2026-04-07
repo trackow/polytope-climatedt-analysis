@@ -311,6 +311,7 @@ class PolytopeZarrStore(MutableMapping):
         self._batch_days = batch_days
         self._frequency = getattr(self, '_frequency', 'monthly')  # set by factory
         self._freq = getattr(self, '_freq', None)  # "MS", "h", "D" — set by factory
+        self.last_request = None
         self._cache = {}
         self._kv = {}
 
@@ -580,6 +581,7 @@ class PolytopeZarrStore(MutableMapping):
 
         try:
             import earthkit.data
+            self.last_request = {"request": dict(request), "address": address, "collection": self._collection}
             with _quiet_polytope_loggers():
                 data = earthkit.data.from_source(
                     "polytope", self._collection, request,
@@ -953,6 +955,7 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
         "%s request for %s (%s)", ftype, var_name, time_info)
     print(f"  🌍 {ftype} request for {var_name} ({time_info})")
 
+    store.last_request = {"request": dict(request), "address": address, "collection": store._collection}
     with _quiet_polytope_loggers():
         data = earthkit.data.from_source(
             "polytope", store._collection, request,
@@ -1110,6 +1113,7 @@ def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
     print(f"  🌍 area request for {var_name} "
           f"({time_info}, area={request['area']}, grid={request['grid']})")
 
+    store.last_request = {"request": dict(request), "address": address, "collection": store._collection}
     with _quiet_polytope_loggers():
         data = earthkit.data.from_source(
             "polytope", store._collection, request,
