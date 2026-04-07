@@ -887,10 +887,10 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
             t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
             t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
             months = pd.date_range(t0, t1, freq="MS")
-            years = sorted({str(m.year) for m in months})
-            mons = sorted({str(m.month) for m in months})
-            request["year"] = "/to/".join([years[0], years[-1]]) if len(years) > 1 else years[0]
-            request["month"] = "/to/".join([mons[0], mons[-1]]) if len(mons) > 1 else mons[0]
+            years = sorted({m.year for m in months})
+            mons = sorted({m.month for m in months})
+            request["year"] = "/to/".join([str(years[0]), str(years[-1])]) if len(years) > 1 else str(years[0])
+            request["month"] = "/to/".join([str(mons[0]), str(mons[-1])]) if len(mons) > 1 else str(mons[0])
         elif time_arg is not None:
             ts = pd.Timestamp(time_arg)
             request["year"] = str(ts.year)
@@ -965,7 +965,29 @@ def _feature_sel(store, var_name, *, bbox=None, polygon=None, point=None,
             return data._json()
         except Exception:
             pass
-    return data.to_xarray()
+
+    ds = data.to_xarray()
+
+    # Clean up GRIB artefacts: squeeze singleton dims like 'number' and
+    # 'step', then drop them so users see only meaningful coordinates.
+    _grib_singletons = ("number", "step", "steps")
+    squeeze = [d for d in _grib_singletons if d in ds.dims and ds.sizes[d] == 1]
+    if squeeze:
+        ds = ds.squeeze(squeeze).drop_vars(squeeze, errors="ignore")
+
+    # Rename time dimension to 'time' for consistency with _area_sel.
+    _dim_renames = {"datetimes": "time", "forecast_reference_time": "time",
+                    "valid_time": "time"}
+    renames = {k: v for k, v in _dim_renames.items() if k in ds.dims}
+    if renames:
+        ds = ds.rename(renames)
+
+    # Ensure the time coordinate is proper datetime64 so that partial
+    # string indexing (e.g. .sel(time="1990-01")) works in xarray.
+    if "time" in ds.coords and not np.issubdtype(ds["time"].dtype, np.datetime64):
+        ds["time"] = pd.to_datetime(ds["time"].values, utc=True).tz_localize(None)
+
+    return ds
 
 
 def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
@@ -1028,33 +1050,27 @@ def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
 
     time_arg = sel_kwargs.get("time")
     if freq == "MS":
-        # Monthly store: keep year/month fields (clmn stream uses these).
-        # Multi-month slices must be fetched per-month and concatenated
-        # because each month has a different step_timedelta (28-31 days),
-        # which prevents earthkit from forming a valid hypercube.
+        # Monthly store: use year/month fields (clmn stream).
+        # Multi-month slices send a single request with unique years
+        # and all months; decoded with time_dim_mode="valid_time"
+        # to avoid the step_timedelta hypercube issue (earthkit-data#948).
         if isinstance(time_arg, slice):
             t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
             t1 = pd.Timestamp(time_arg.stop or store._coords["time"][-1])
             months = pd.date_range(t0, t1, freq="MS")
-            pieces = []
-            for mon in months:
-                req_i = dict(request)
-                req_i["year"] = str(mon.year)
-                req_i["month"] = str(mon.month)
-                pieces.append((mon, req_i))
-            _multi_month = pieces  # handled in fetch section below
+            unique_years = sorted(set(m.year for m in months))
+            unique_months = sorted(set(m.month for m in months))
+            request["year"] = "/".join(str(y) for y in unique_years)
+            request["month"] = "/".join(str(m) for m in unique_months)
         elif time_arg is not None:
             ts = pd.Timestamp(time_arg)
             request["year"] = str(ts.year)
             request["month"] = str(ts.month)
-            _multi_month = None
         else:
             ts = pd.Timestamp(store._coords["time"][0])
             request["year"] = str(ts.year)
             request["month"] = str(ts.month)
-            _multi_month = None
     else:
-        _multi_month = None
         # Hourly / daily store
         if isinstance(time_arg, slice):
             t0 = pd.Timestamp(time_arg.start or store._coords["time"][0])
@@ -1088,21 +1104,6 @@ def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
         renames = {k: v for k, v in _dim_renames.items() if k in ds.dims}
         return ds.rename(renames) if renames else ds
 
-    if _multi_month is not None:
-        # Fetch each month individually to avoid step_timedelta mismatch
-        import xarray as xr
-        datasets = []
-        for mon, req_i in _multi_month:
-            time_info = f"{req_i['year']}-{req_i['month']}"
-            print(f"  🌍 area request for {var_name} "
-                  f"({time_info}, area={req_i['area']}, grid={req_i['grid']})")
-            with _quiet_polytope_loggers():
-                data = earthkit.data.from_source(
-                    "polytope", store._collection, req_i,
-                    address=address, stream=False)
-            datasets.append(_rename_dims(data.to_xarray()))
-        return xr.concat(datasets, dim="time")
-
     logging.getLogger(__name__).info(
         "area request for %s (grid=%s)", var_name, request["grid"])
     time_info = request.get("date", f"{request.get('year')}-{request.get('month')}")
@@ -1113,7 +1114,12 @@ def _area_sel(store, var_name, *, area, grid=None, **sel_kwargs):
         data = earthkit.data.from_source(
             "polytope", store._collection, request,
             address=address, stream=False)
-    return _rename_dims(data.to_xarray())
+
+    # drop_dims="step" avoids the step_timedelta hypercube issue for monthly
+    # means (each month has 28-31 day step). This keeps forecast_reference_time
+    # as the time axis (the actual month start), not valid_time (which is
+    # shifted forward by one month for monthly accumulations).
+    return _rename_dims(data.to_xarray(drop_dims="step"))
 
 
 try:
