@@ -369,3 +369,211 @@ PORTFOLIO_GEN2_STORYLINE = {
         "variables": _story_vars(CLTE_O3D_VARIABLES, D_STORY_SFC, D_STORY_LEV),
     },
 }
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Variable lookup helpers
+# ════════════════════════════════════════════════════════════════════
+
+# Time ranges per experiment (inclusive).
+# Monthly stores use year ranges; hourly/daily stores use full timestamps.
+_EXPERIMENT_TIME_RANGES = {
+    "cont":      {"start": "1990-01-01", "end": "1999-12-31"},   # min 10 years from 1990
+    "hist":      {"start": "1990-01-01", "end": "2014-12-31"},
+    "SSP3-7.0":  {"start": "2015-01-01", "end": "2049-12-31"},
+}
+
+_STORYLINE_TIME_RANGES = {
+    "cont":      {"start": "2017-01-01", "end": "2024-12-31"},
+    "hist":      {"start": "2017-01-01", "end": "2024-12-31"},
+    "Tplus2.0K": {"start": "2017-01-01", "end": "2024-12-31"},
+}
+
+_STREAMS = {
+    "clmn": {
+        "portfolio": PORTFOLIO_GEN2_CLMN,
+        "label": "monthly",
+        "models": ["IFS-NEMO", "IFS-FESOM", "ICON"],
+        "nside": {"standard": 128, "high": 1024},
+        "experiments": ["cont", "hist", "SSP3-7.0"],
+        "time_ranges": _EXPERIMENT_TIME_RANGES,
+    },
+    "clte": {
+        "portfolio": PORTFOLIO_GEN2_CLTE,
+        "label": "hourly",
+        "models": ["IFS-NEMO", "IFS-FESOM", "ICON"],
+        "nside": {"standard": 128, "high": 1024},
+        "experiments": ["cont", "hist", "SSP3-7.0"],
+        "time_ranges": _EXPERIMENT_TIME_RANGES,
+    },
+    "storyline": {
+        "portfolio": PORTFOLIO_GEN2_STORYLINE,
+        "label": "hourly (storyline)",
+        "models": ["IFS-FESOM"],
+        "nside": {"standard": 128, "high": 512},
+        "experiments": ["cont", "hist", "Tplus2.0K"],
+        "time_ranges": _STORYLINE_TIME_RANGES,
+    },
+}
+
+
+def find_variable(query=None):
+    """Search the Climate DT portfolio for a variable.
+
+    Parameters
+    ----------
+    query : str, optional
+        A shortName (e.g. ``"2t"``, ``"avg_2t"``), or a substring to
+        match against long_name (e.g. ``"temperature"``).
+        Fuzzy: ``"2t"`` also matches ``"avg_2t"`` and vice-versa.
+        If omitted, returns the full catalogue.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per stream × levtype match, with columns:
+        stream, shortName, levtype, freq, access, long_name, units,
+        models, nside.
+    """
+    import pandas as pd
+
+    rows = []
+    for stream_name, info in _STREAMS.items():
+        portfolio = info["portfolio"]
+        for lt_key, lt_spec in portfolio.items():
+            for var_name, var_spec in lt_spec["variables"].items():
+                if query is not None:
+                    q = query.lower()
+                    bare = var_name.removeprefix("avg_")
+                    hit = (q == var_name.lower()
+                           or q == bare.lower()
+                           or q == f"avg_{bare}".lower()
+                           or q in var_spec["long_name"].lower())
+                    if not hit:
+                        continue
+                freq_label = {"MS": "monthly", "h": "hourly", "D": "daily"}
+                rows.append({
+                    "stream": stream_name,
+                    "shortName": var_name,
+                    "levtype": lt_spec["levtype"],
+                    "freq": freq_label.get(lt_spec["freq"], lt_spec["freq"]),
+                    "access": f'{info["label"]}/{lt_spec["levtype"]}',
+                    "long_name": var_spec["long_name"],
+                    "units": var_spec["units"],
+                    "models": ", ".join(info["models"]),
+                    "experiments": ", ".join(info["experiments"]),
+                    "nside": str(info["nside"]),
+                })
+
+    df = pd.DataFrame(rows)
+    if len(df):
+        df = df.sort_values(["shortName", "stream", "levtype"]).reset_index(drop=True)
+    return df
+
+
+def access_snippet(query, stream="clte", experiment=None, model=None):
+    """Print a ready-to-copy ``from_climate_dt()`` call for a variable.
+
+    Parameters
+    ----------
+    query : str
+        A shortName (e.g. ``"2t"``). Fuzzy matching as in ``find_variable``.
+    stream : str
+        ``"clmn"``, ``"clte"``, or ``"storyline"``.
+    experiment : str or list of str, optional
+        Override the experiment(s). Defaults to ``"hist"`` for clmn/clte,
+        or ``["cont", "hist", "Tplus2.0K"]`` for storyline.
+    model : str, optional
+        Override the model. Defaults to ``"IFS-NEMO"`` for clmn/clte,
+        ``"IFS-FESOM"`` for storyline.
+    """
+    df = find_variable(query)
+    df = df[df["stream"] == stream]
+    if df.empty:
+        print(f"No match for '{query}' in stream '{stream}'.")
+        return
+
+    # Prefer exact shortName match over long_name substring hits,
+    # and prefer levtypes available for all models (pl > hl, o2d > o3d, etc.)
+    _LT_PRIO = {"sfc": 0, "pl": 1, "o2d": 2, "o3d": 3, "sol": 4, "hl": 5}
+    exact = df[df["shortName"].str.lower().isin([query.lower(), f"avg_{query.lower()}"])]
+    candidates = exact if not exact.empty else df
+    row = candidates.sort_values(
+        "levtype", key=lambda s: s.map(_LT_PRIO).fillna(9)
+    ).iloc[0]
+    info = _STREAMS[stream]
+
+    freq_kw = "monthly" if row["freq"] == "monthly" else "hourly"
+    models = [model] if model else info["models"]
+    models_str = ", ".join(f'"{m}"' for m in models)
+
+    # Resolve experiment and its time range
+    if stream == "storyline":
+        exp = experiment or info["experiments"]
+        exp_key = exp[0] if isinstance(exp, list) else exp
+    else:
+        exp = experiment or "hist"
+        exp_key = exp
+
+    tr = info["time_ranges"].get(exp_key, {"start": "1990-01-01", "end": "1990-12-31"})
+    start_year = int(tr["start"][:4])
+    end_year = int(tr["end"][:4])
+
+    lines = [
+        "from polytope_zarr import PolytopeZarrStore\n",
+        "store = PolytopeZarrStore.from_climate_dt(",
+        f'    models=[{models_str}],',
+    ]
+
+    if stream == "storyline":
+        lines.append(f'    experiment={exp},')
+        lines.append(f'    activity="story-nudging",')
+    else:
+        lines.append(f'    experiment="{exp}",')
+
+    lines.append(f'    levtype="{row["levtype"]}",')
+    lines.append(f'    frequency="{freq_kw}",')
+
+    if freq_kw == "monthly":
+        lines.append(f'    years=range({start_year}, {end_year + 1}),')
+    else:
+        lines.append(f'    start_date="{tr["start"]}T00:00:00",')
+        lines.append(f'    end_date="{tr["end"]}T23:00:00",')
+
+    lines.append('    resolution="standard",')
+    lines.append(")")
+    lines.append("")
+    lines.append("ds = store.open()")
+
+    # Quick-look plot of the first timestep
+    var = row["shortName"]
+    first_model = models[0]
+    if freq_kw == "monthly":
+        first_time = f"{start_year}-01-01"
+    else:
+        first_time = f"{tr['start']}T00:00"
+
+    sel_dim = "climate" if stream == "storyline" else "model"
+
+    # Check if this levtype has vertical levels
+    lt_key = row["levtype"]
+    portfolio = info["portfolio"]
+    levels = portfolio[lt_key]["levels"]
+
+    sel_parts = f'{sel_dim}="{first_model}", time="{first_time}"'
+    if levels is not None:
+        first_level = levels[0]
+        sel_parts += f", level={first_level}"
+
+    lines.append("")
+    lines.append("import healpy as hp")
+    lines.append(f'field = ds["{var}"].sel({sel_parts})')
+    lines.append(f'hp.mollview(field.values, title="{first_model} — {var} — {first_time}",')
+    lines.append(f'           unit="{row["units"]}", cmap="RdYlBu_r", nest=True, flip="geo")')
+
+    code = "\n".join(lines)
+    try:
+        from IPython.display import display, Markdown
+        display(Markdown(f"```python\n{code}\n```"))
+    except ImportError:
+        print(code)
