@@ -12,7 +12,7 @@ Supports the three Climate DT models **IFS-NEMO**, **IFS-FESOM**, and **ICON**.
 
 ```bash
 git clone https://github.com/trackow/polytope-climatedt-analysis.git
-cd polytope-climate-analysis
+cd polytope-climatedt-analysis
 ```
 
 ### 2. Set up the Python environment
